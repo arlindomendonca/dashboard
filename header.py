@@ -143,13 +143,13 @@ def render(pagina_atual: str):
             css_class = "nav-btn-active" if pagina_atual == "atendimentos" else "nav-btn"
             st.markdown(f'<div class="{css_class}">', unsafe_allow_html=True)
             if st.button("📋 Atendimentos", use_container_width=True, key="nav_atend"):
-                st.switch_page("pages/1_Atendimentos.py")
+                st.switch_page("app.py")
             st.markdown('</div>', unsafe_allow_html=True)
         with n2:
             css_class = "nav-btn-active" if pagina_atual == "configuracoes" else "nav-btn"
             st.markdown(f'<div class="{css_class}">', unsafe_allow_html=True)
             if st.button("⚙️ Configurações", use_container_width=True, key="nav_config"):
-                st.switch_page("pages/2_Configuracoes.py")
+                st.switch_page("pages/Configuracoes.py")
             st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<hr style='margin: 0 0 20px 0'>", unsafe_allow_html=True)
