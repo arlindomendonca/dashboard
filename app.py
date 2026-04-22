@@ -183,6 +183,12 @@ if btn_filtrar:
 ini_usada = st.session_state["ini"]
 fim_usada = st.session_state["fim"]
 
+# ── Debug mode ───────────────────────────────────────────────────
+with st.expander("🔧 Diagnóstico da API (expandir para ver detalhes)", expanded=False):
+    debug_mode = st.checkbox("Ativar modo debug (mostra resposta bruta da API)", value=False)
+    if debug_mode:
+        st.session_state.pop("df_cache", None)  # força nova busca com debug
+
 # ── Busca na API ──────────────────────────────────────────────────
 cache_key = f"{ini_usada}_{fim_usada}"
 if st.session_state.get("df_cache_key") != cache_key or "df_cache" not in st.session_state:
@@ -190,6 +196,7 @@ if st.session_state.get("df_cache_key") != cache_key or "df_cache" not in st.ses
         df = buscar_atendimentos_abertos(
             data_ini=ini_usada.strftime("%d/%m/%Y"),
             data_fim=fim_usada.strftime("%d/%m/%Y"),
+            debug=debug_mode if "debug_mode" in dir() else False,
         )
     st.session_state["df_cache"]     = df
     st.session_state["df_cache_key"] = cache_key
@@ -201,11 +208,17 @@ total = len(df)
 # ── KPIs (seguro para df vazio ou sem colunas) ────────────────────
 def safe_nunique(df, col):
     if df.empty or col not in df.columns: return 0
-    return int(df[col].nunique())
+    try:
+        return int(df[col].astype(str).nunique())
+    except Exception:
+        return 0
 
 def safe_count_vazio(df, col):
     if df.empty or col not in df.columns: return 0
-    return int(df[col].isin(["—", "-", "", "None", "nan"]).sum())
+    try:
+        return int(df[col].astype(str).isin(["—", "-", "", "None", "nan", "none"]).sum())
+    except Exception:
+        return 0
 
 total_setores = safe_nunique(df, "Setor")
 sem_atendente = safe_count_vazio(df, "Atendente")
