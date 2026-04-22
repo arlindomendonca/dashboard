@@ -1,74 +1,119 @@
 -- ══════════════════════════════════════════════════════════════
--- SETUP SUPABASE — Sistema de Atendimentos Rio Verde (v2)
+-- SETUP SUPABASE — Sistema de Atendimentos Rio Verde v3
 -- Execute em: Supabase → SQL Editor → New Query
 -- ══════════════════════════════════════════════════════════════
 
--- ── 1. Tabela profiles ────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS public.profiles (
-    id         UUID        PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-    email      TEXT        NOT NULL,
-    nome       TEXT        NOT NULL,
-    perfil     TEXT        NOT NULL DEFAULT 'usuario'
-                           CHECK (perfil IN ('admin', 'usuario')),
-    aprovado   BOOLEAN     NOT NULL DEFAULT FALSE,
-    ativo      BOOLEAN     NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+-- ── 1. Contribuintes ─────────────────────────────────────────
+-- UUID vem da API Gove (campo uuid do objeto recipient)
+CREATE TABLE IF NOT EXISTS public.contribuintes (
+    uuid        TEXT        PRIMARY KEY,   -- uuid retornado pela API Gove
+    name        TEXT,
+    email       TEXT,
+    created_at  TIMESTAMPTZ,
+    synced_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- ── 2. RLS — qualquer autenticado lê/atualiza o próprio ───────
-ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.contribuintes ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "contribuintes_select" ON public.contribuintes;
+DROP POLICY IF EXISTS "contribuintes_insert" ON public.contribuintes;
+DROP POLICY IF EXISTS "contribuintes_update" ON public.contribuintes;
+CREATE POLICY "contribuintes_select" ON public.contribuintes FOR SELECT USING (TRUE);
+CREATE POLICY "contribuintes_insert" ON public.contribuintes FOR INSERT WITH CHECK (TRUE);
+CREATE POLICY "contribuintes_update" ON public.contribuintes FOR UPDATE USING (TRUE);
 
--- Leitura: autenticado lê qualquer perfil (necessário para verificar aprovação)
-CREATE POLICY "autenticado_le_profiles"
-    ON public.profiles FOR SELECT
-    USING (auth.role() = 'authenticated');
+-- ── 2. Atendentes ─────────────────────────────────────────────
+-- UUID vem da API Gove (campo uuid do objeto agent)
+CREATE TABLE IF NOT EXISTS public.atendentes (
+    uuid        TEXT        PRIMARY KEY,
+    name        TEXT,
+    email       TEXT,
+    created_at  TIMESTAMPTZ,
+    synced_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
--- Atualização: admin pode atualizar qualquer perfil
-CREATE POLICY "admin_atualiza_profiles"
-    ON public.profiles FOR UPDATE
-    USING (
-        EXISTS (
-            SELECT 1 FROM public.profiles
-            WHERE id = auth.uid() AND perfil = 'admin'
-        )
-    );
+ALTER TABLE public.atendentes ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "atendentes_select" ON public.atendentes;
+DROP POLICY IF EXISTS "atendentes_insert" ON public.atendentes;
+DROP POLICY IF EXISTS "atendentes_update" ON public.atendentes;
+CREATE POLICY "atendentes_select" ON public.atendentes FOR SELECT USING (TRUE);
+CREATE POLICY "atendentes_insert" ON public.atendentes FOR INSERT WITH CHECK (TRUE);
+CREATE POLICY "atendentes_update" ON public.atendentes FOR UPDATE USING (TRUE);
 
--- Inserção: o próprio trigger insere (via service role)
-CREATE POLICY "service_insere_profiles"
-    ON public.profiles FOR INSERT
-    WITH CHECK (TRUE);
+-- ── 3. Setores ────────────────────────────────────────────────
+-- UUID vem da API Gove (campo uuid do objeto sector)
+CREATE TABLE IF NOT EXISTS public.setores (
+    uuid        TEXT        PRIMARY KEY,
+    name        TEXT,
+    acronym     TEXT,
+    synced_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
--- ── 3. Trigger: cria perfil ao registrar usuário ──────────────
-CREATE OR REPLACE FUNCTION public.handle_new_user()
-RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
-BEGIN
-    INSERT INTO public.profiles (id, email, nome, aprovado)
-    VALUES (
-        NEW.id,
-        NEW.email,
-        COALESCE(
-            NEW.raw_user_meta_data->>'nome',
-            SPLIT_PART(NEW.email, '@', 1)
-        ),
-        FALSE   -- toda conta nova fica pendente
-    )
-    ON CONFLICT (id) DO NOTHING;
-    RETURN NEW;
-END;
-$$;
+ALTER TABLE public.setores ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "setores_select" ON public.setores;
+DROP POLICY IF EXISTS "setores_insert" ON public.setores;
+DROP POLICY IF EXISTS "setores_update" ON public.setores;
+CREATE POLICY "setores_select" ON public.setores FOR SELECT USING (TRUE);
+CREATE POLICY "setores_insert" ON public.setores FOR INSERT WITH CHECK (TRUE);
+CREATE POLICY "setores_update" ON public.setores FOR UPDATE USING (TRUE);
 
-DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
-CREATE TRIGGER on_auth_user_created
-    AFTER INSERT ON auth.users
-    FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+-- ── 4. Atendimentos ───────────────────────────────────────────
+-- Chave primária = id do chat na API Gove
+-- FKs para contribuinte, atendente e setor via uuid
+CREATE TABLE IF NOT EXISTS public.atendimentos (
+    id                  TEXT        PRIMARY KEY,   -- id do chat (API Gove)
+    protocolo           TEXT,
+    status              TEXT,
+    tipo                TEXT,
+    contribuinte_uuid   TEXT REFERENCES public.contribuintes(uuid) ON DELETE SET NULL,
+    atendente_uuid      TEXT REFERENCES public.atendentes(uuid)    ON DELETE SET NULL,
+    setor_uuid          TEXT REFERENCES public.setores(uuid)        ON DELETE SET NULL,
+    -- Campos adicionais da API (armazena tudo)
+    dados_extras        JSONB,                     -- demais campos do JSON da API
+    aberto_em           TIMESTAMPTZ,
+    encerrado_em        TIMESTAMPTZ,
+    synced_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
--- ── 4. Promover admin ─────────────────────────────────────────
--- Execute DEPOIS de criar sua conta no sistema:
-UPDATE public.profiles
-SET perfil = 'admin', aprovado = TRUE
-WHERE email = 'arlindo.mendonca@outlook.com';
+CREATE INDEX IF NOT EXISTS idx_atend_status      ON public.atendimentos(status);
+CREATE INDEX IF NOT EXISTS idx_atend_aberto_em   ON public.atendimentos(aberto_em DESC);
+CREATE INDEX IF NOT EXISTS idx_atend_contribuinte ON public.atendimentos(contribuinte_uuid);
+CREATE INDEX IF NOT EXISTS idx_atend_atendente    ON public.atendimentos(atendente_uuid);
+CREATE INDEX IF NOT EXISTS idx_atend_setor        ON public.atendimentos(setor_uuid);
 
--- ── 5. Verificar ─────────────────────────────────────────────
-SELECT id, email, nome, perfil, aprovado, ativo, created_at
-FROM public.profiles
-ORDER BY created_at DESC;
+ALTER TABLE public.atendimentos ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "atendimentos_select" ON public.atendimentos;
+DROP POLICY IF EXISTS "atendimentos_insert" ON public.atendimentos;
+DROP POLICY IF EXISTS "atendimentos_update" ON public.atendimentos;
+CREATE POLICY "atendimentos_select" ON public.atendimentos FOR SELECT USING (TRUE);
+CREATE POLICY "atendimentos_insert" ON public.atendimentos FOR INSERT WITH CHECK (TRUE);
+CREATE POLICY "atendimentos_update" ON public.atendimentos FOR UPDATE USING (TRUE);
+
+-- ── 5. View: atendimentos completa (join com nomes) ───────────
+CREATE OR REPLACE VIEW public.v_atendimentos AS
+SELECT
+    a.id,
+    a.protocolo,
+    a.status,
+    a.tipo,
+    c.name                              AS contribuinte_nome,
+    c.email                             AS contribuinte_email,
+    ag.name                             AS atendente_nome,
+    ag.email                            AS atendente_email,
+    s.name                              AS setor_nome,
+    s.acronym                           AS setor_sigla,
+    a.aberto_em,
+    a.encerrado_em,
+    a.synced_at,
+    a.updated_at
+FROM public.atendimentos a
+LEFT JOIN public.contribuintes c  ON c.uuid  = a.contribuinte_uuid
+LEFT JOIN public.atendentes    ag ON ag.uuid = a.atendente_uuid
+LEFT JOIN public.setores       s  ON s.uuid  = a.setor_uuid;
+
+-- ── 6. Verificação final ──────────────────────────────────────
+SELECT
+    'contribuintes'  AS tabela, COUNT(*) AS registros FROM public.contribuintes
+UNION ALL SELECT 'atendentes',  COUNT(*) FROM public.atendentes
+UNION ALL SELECT 'setores',     COUNT(*) FROM public.setores
+UNION ALL SELECT 'atendimentos',COUNT(*) FROM public.atendimentos;
