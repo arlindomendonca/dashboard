@@ -1,6 +1,7 @@
 """
 supabase_client.py — Integração com Supabase via REST API.
-Operações de upsert para contribuintes, atendentes, setores e atendimentos.
+Fluxo: Atendentes → Setores → Atendimentos
+(Contribuinte excluído: recipient é só telefone, sem UUID próprio)
 """
 import os
 import requests
@@ -19,24 +20,21 @@ def _h() -> dict:
     return {
         "apikey":       _key(),
         "Content-Type": "application/json",
-        "Prefer":       "resolution=merge-duplicates,return=representation",
+        "Prefer":       "resolution=merge-duplicates,return=minimal",
     }
 
 def _rest(table: str) -> str:
     return f"{_url()}/rest/v1/{table}"
 
+
 # ─────────────────────────────────────────────
-# Upsert genérico
+# Upsert genérico em lote
 # ─────────────────────────────────────────────
-def _upsert(table: str, records: list[dict], on_conflict: str = "uuid") -> dict:
-    """
-    Upsert em lote. Retorna dict com ok, inserted, updated, error.
-    on_conflict: coluna de chave única para merge (uuid ou id).
-    """
+def _upsert(table: str, records: list[dict], on_conflict: str) -> dict:
     if not records:
         return {"ok": True, "count": 0}
 
-    # Remove duplicatas pelo campo de chave
+    # Deduplica pela chave
     seen, unique = set(), []
     for r in records:
         key = r.get(on_conflict)
@@ -47,135 +45,125 @@ def _upsert(table: str, records: list[dict], on_conflict: str = "uuid") -> dict:
     if not unique:
         return {"ok": True, "count": 0}
 
-    url = f"{_rest(table)}?on_conflict={on_conflict}"
     try:
-        r = requests.post(url, json=unique, headers=_h(), timeout=30)
+        r = requests.post(
+            f"{_rest(table)}?on_conflict={on_conflict}",
+            json=unique,
+            headers=_h(),
+            timeout=30,
+        )
         if r.status_code in (200, 201):
             return {"ok": True, "count": len(unique)}
-        return {"ok": False, "count": 0,
-                "error": f"HTTP {r.status_code}: {r.text[:300]}"}
+
+        # Erro — monta mensagem detalhada
+        try:
+            err_json = r.json()
+            err_msg  = err_json.get("message") or err_json.get("error") or r.text[:400]
+        except Exception:
+            err_msg = r.text[:400]
+
+        return {
+            "ok":    False,
+            "count": 0,
+            "error": f"HTTP {r.status_code} em '{table}': {err_msg}",
+        }
     except Exception as e:
-        return {"ok": False, "count": 0, "error": str(e)}
+        return {"ok": False, "count": 0, "error": f"Exceção em '{table}': {str(e)}"}
+
 
 # ─────────────────────────────────────────────
-# Funções específicas por entidade
+# Upsert por entidade
 # ─────────────────────────────────────────────
-def upsert_contribuintes(parsed: list[dict]) -> dict:
-    """Extrai contribuintes únicos e faz upsert."""
+def upsert_atendentes(chats: list[dict]) -> dict:
+    """Extrai atendentes únicos (por agent_uuid) e faz upsert."""
+    now = datetime.utcnow().isoformat()
     records = []
-    for p in parsed:
-        if p.get("contribuinte_uuid"):
+    for c in chats:
+        if c.get("agent_uuid"):
             records.append({
-                "uuid":       p["contribuinte_uuid"],
-                "name":       p.get("_contribuinte_nome"),
-                "email":      p.get("_contribuinte_email"),
-                "created_at": p.get("_contribuinte_created_at"),
-                "synced_at":  datetime.utcnow().isoformat(),
-            })
-    return _upsert("contribuintes", records, on_conflict="uuid")
-
-
-def upsert_atendentes(parsed: list[dict]) -> dict:
-    """Extrai atendentes únicos e faz upsert."""
-    records = []
-    for p in parsed:
-        if p.get("atendente_uuid"):
-            records.append({
-                "uuid":       p["atendente_uuid"],
-                "name":       p.get("_atendente_nome"),
-                "email":      p.get("_atendente_email"),
-                "created_at": p.get("_atendente_created_at"),
-                "synced_at":  datetime.utcnow().isoformat(),
+                "uuid":       c["agent_uuid"],
+                "name":       c.get("agent_name"),
+                "email":      c.get("agent_email"),
+                "created_at": c.get("agent_created_at"),
+                "synced_at":  now,
             })
     return _upsert("atendentes", records, on_conflict="uuid")
 
 
-def upsert_setores(parsed: list[dict]) -> dict:
-    """Extrai setores únicos e faz upsert."""
+def upsert_setores(chats: list[dict]) -> dict:
+    """Extrai setores únicos (por sector_uuid) e faz upsert."""
+    now = datetime.utcnow().isoformat()
     records = []
-    for p in parsed:
-        if p.get("setor_uuid"):
+    for c in chats:
+        if c.get("sector_uuid"):
             records.append({
-                "uuid":      p["setor_uuid"],
-                "name":      p.get("_setor_nome"),
-                "acronym":   p.get("_setor_sigla"),
-                "synced_at": datetime.utcnow().isoformat(),
+                "uuid":      c["sector_uuid"],
+                "name":      c.get("sector_name"),
+                "acronym":   c.get("sector_acronym"),
+                "synced_at": now,
             })
     return _upsert("setores", records, on_conflict="uuid")
 
 
-def upsert_atendimentos(parsed: list[dict]) -> dict:
-    """Faz upsert dos atendimentos (atualiza se já existe)."""
-    import json
+def upsert_atendimentos(chats: list[dict]) -> dict:
+    """Faz upsert dos atendimentos. Atualiza se já existir."""
+    now = datetime.utcnow().isoformat()
     records = []
-    for p in parsed:
-        if not p.get("id"):
+    for c in chats:
+        if not c.get("id"):
             continue
         records.append({
-            "id":               p["id"],
-            "protocolo":        p.get("protocolo"),
-            "status":           p.get("status"),
-            "tipo":             p.get("tipo"),
-            "contribuinte_uuid":p.get("contribuinte_uuid"),
-            "atendente_uuid":   p.get("atendente_uuid"),
-            "setor_uuid":       p.get("setor_uuid"),
-            "aberto_em":        p.get("aberto_em"),
-            "encerrado_em":     p.get("encerrado_em"),
-            "dados_extras":     p.get("dados_extras") or {},
-            "synced_at":        datetime.utcnow().isoformat(),
-            "updated_at":       datetime.utcnow().isoformat(),
+            "id":            c["id"],
+            "recipient":     c.get("recipient"),       # telefone do contribuinte
+            "status":        c.get("_status"),
+            "agent_uuid":    c.get("agent_uuid"),
+            "sector_uuid":   c.get("sector_uuid"),
+            "started_at":    c.get("started_at"),
+            "finished_at":   c.get("finished_at"),
+            "rating":        c.get("rating"),
+            "synced_at":     now,
+            "updated_at":    now,
         })
     return _upsert("atendimentos", records, on_conflict="id")
 
 
-def integrar_tudo(parsed: list[dict]) -> dict:
+# ─────────────────────────────────────────────
+# Pipeline completa
+# ─────────────────────────────────────────────
+def integrar_tudo(chats: list[dict]) -> dict:
     """
-    Executa toda a pipeline de integração em ordem:
-    1. Contribuintes, 2. Atendentes, 3. Setores, 4. Atendimentos
-    Retorna resumo de cada etapa.
+    Integra em ordem: Atendentes → Setores → Atendimentos.
+    Retorna resumo por entidade + flag ok global.
     """
-    now = datetime.utcnow().isoformat()
-    resultados = {}
-
-    # Enriquece parsed com campos extras dos objetos aninhados
-    # (email e created_at que parse_atendimento não propaga)
-    # Feito aqui para não poluir a função parse_atendimento
-    resultados["contribuintes"] = upsert_contribuintes(parsed)
-    resultados["atendentes"]    = upsert_atendentes(parsed)
-    resultados["setores"]       = upsert_setores(parsed)
-    resultados["atendimentos"]  = upsert_atendimentos(parsed)
-
-    resultados["ok"] = all(v.get("ok", False) for v in resultados.values()
-                           if isinstance(v, dict))
-    return resultados
+    res = {}
+    res["atendentes"]   = upsert_atendentes(chats)
+    res["setores"]      = upsert_setores(chats)
+    res["atendimentos"] = upsert_atendimentos(chats)
+    res["ok"] = all(v.get("ok", False) for v in res.values() if isinstance(v, dict))
+    return res
 
 
 # ─────────────────────────────────────────────
-# Leitura para a página de Configurações
+# Leitura para Configurações
 # ─────────────────────────────────────────────
 def contar_registros() -> dict:
-    """Conta registros em cada tabela para exibir no painel."""
     totais = {}
-    for tabela in ["contribuintes", "atendentes", "setores", "atendimentos"]:
+    for tabela, col in [("atendentes","uuid"), ("setores","uuid"), ("atendimentos","id")]:
         try:
             r = requests.get(
                 _rest(tabela),
                 headers={**_h(), "Prefer": "count=exact"},
-                params={"select": "id" if tabela == "atendimentos" else "uuid",
-                        "limit": "1"},
+                params={"select": col, "limit": "1"},
                 timeout=10,
             )
-            # Supabase retorna o count no header Content-Range
             cr = r.headers.get("content-range", "")
-            total = int(cr.split("/")[-1]) if "/" in cr else len(r.json())
-            totais[tabela] = total
+            totais[tabela] = int(cr.split("/")[-1]) if "/" in cr else len(r.json())
         except Exception:
             totais[tabela] = "—"
     return totais
 
 
-def listar_tabela(tabela: str, limit: int = 100) -> list[dict]:
-    """Lista registros de uma tabela para visualização."""
+def listar_tabela(tabela: str, limit: int = 200) -> list[dict]:
     try:
         r = requests.get(
             _rest(tabela),
